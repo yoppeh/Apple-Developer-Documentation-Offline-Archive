@@ -13,9 +13,20 @@ Configuration (environment variables):
   APPLE_DOCS_INDEX                            search index file (default .mcp-index.sqlite
                                               next to the markdown directory)
   APPLE_DOCS_INDEX_REFRESH                    seconds between index refreshes (default 3600)
+  APPLE_DOCS_ONDEMAND                         fetch pages missing from the archive from
+                                              developer.apple.com when requested (default 1)
+  APPLE_DOCS_ONDEMAND_DIR                     where fetched pages are kept (default .ondemand
+                                              next to the markdown directory)
+  APPLE_DOCS_ONDEMAND_MAX_AGE_DAYS            re-check fetched pages older than this (default 30)
+
+Pages fetched on demand live in their own store with their own manifest, written
+only by this server, so the server never writes the archive's .docsync manifest
+(which discovery and update_pull own). An archive copy of a page always wins.
 """
 
 import functools
+import importlib.util
+import json
 import logging
 import os
 import re
@@ -23,6 +34,10 @@ import sqlite3
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 import anyio
@@ -40,6 +55,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 MARKDOWN_DIR = Path(os.environ.get("APPLE_DOCS_MARKDOWN_DIR", SCRIPT_DIR / "markdown")).resolve()
 INDEX_PATH = Path(os.environ.get("APPLE_DOCS_INDEX", MARKDOWN_DIR.parent / ".mcp-index.sqlite"))
 INDEX_REFRESH = int(os.environ.get("APPLE_DOCS_INDEX_REFRESH", "3600"))
+ONDEMAND = os.environ.get("APPLE_DOCS_ONDEMAND", "1").lower() not in ("0", "false", "no", "off")
+ONDEMAND_DIR = Path(os.environ.get("APPLE_DOCS_ONDEMAND_DIR", MARKDOWN_DIR.parent / ".ondemand")).resolve()
+ONDEMAND_MD = ONDEMAND_DIR / "markdown"
+ONDEMAND_MAX_AGE = float(os.environ.get("APPLE_DOCS_ONDEMAND_MAX_AGE_DAYS", "30")) * 86400
+# Markdown roots, highest priority first
+ROOTS = [MARKDOWN_DIR, ONDEMAND_MD]
 
 HOST = os.environ.get("APPLE_DOCS_MCP_HOST", "0.0.0.0")
 PORT = int(os.environ.get("APPLE_DOCS_MCP_PORT", "9111"))
@@ -74,7 +95,7 @@ def to_doc_path(ref: str) -> str:
         s = m.group(1) if m else ""
         if s.startswith("tutorials/data/"):
             s = s[len("tutorials/data/"):]
-        s = s.split("?", 1)[0].split("#", 1)[0]
+        s = urllib.parse.unquote(s.split("?", 1)[0].split("#", 1)[0])
         if s.endswith(".json"):
             s = s[:-5]
     s = s.split("#", 1)[0].lstrip("/")
@@ -87,15 +108,23 @@ def to_doc_path(ref: str) -> str:
 
 
 def doc_file(doc_path: str) -> Path | None:
-    """The .md file for a doc path, or None if it isn't in the archive (or escapes it)."""
+    """The .md file for a doc path (archive first, then pages fetched on demand),
+    or None if there isn't one (or the path escapes the roots)."""
     if not doc_path or any(part in ("", ".", "..") for part in doc_path.split("/")):
         return None
-    f = MARKDOWN_DIR / f"{doc_path}.md"
-    try:
-        f.resolve().relative_to(MARKDOWN_DIR)
-    except ValueError:
-        return None
-    return f if f.is_file() else None
+    for root in ROOTS:
+        f = root / f"{doc_path}.md"
+        try:
+            f.resolve().relative_to(root.resolve())
+        except (ValueError, OSError):
+            continue
+        if f.is_file():
+            return f
+    return None
+
+
+def is_ondemand(f: Path) -> bool:
+    return f.is_relative_to(ONDEMAND_MD)
 
 
 def resolve_doc(ref: str) -> tuple[str, Path | None, str | None]:
@@ -104,11 +133,20 @@ def resolve_doc(ref: str) -> tuple[str, Path | None, str | None]:
     if not doc_path or any(part in ("", ".", "..") for part in doc_path.split("/")):
         return doc_path, None, f"Not a documentation path: {ref!r}"
     f = doc_file(doc_path)
+    if f and is_ondemand(f) and ondemand.is_stale(doc_path):
+        f = ondemand.fetch(doc_path)[0] or f  # keep the old copy if the refresh fails
     if f:
         return doc_path, f, None
     if (MARKDOWN_DIR / doc_path).is_dir():
         return doc_path, None, f"'{doc_path}' has no page of its own. Use list_symbols to browse it."
+    f, fetch_error = ondemand.fetch(doc_path)
+    if f:
+        return doc_path, f, None
     msg = f"Document not found: {doc_path}"
+    if fetch_error:
+        msg += f" (not in the archive, and fetching it failed: {fetch_error})"
+    elif ONDEMAND:
+        msg += " (not in the archive or on developer.apple.com)"
     suggestions = index.suggest(doc_path)
     if suggestions:
         msg += "\nDid you mean:\n" + "\n".join(f"  {p}" for p in suggestions)
@@ -368,6 +406,147 @@ def load_doc(f: Path) -> tuple[str, dict, int]:
 
 
 # ---------------------------------------------------------------------------
+# On-demand fetching of pages that aren't in the archive
+# ---------------------------------------------------------------------------
+API_BASE = "https://developer.apple.com/tutorials/data/documentation/"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+# Characters that appear in Apple doc paths (operators included); anything else isn't fetched
+FETCHABLE = re.compile(r"[a-z0-9_\-.:()'!=&*+<>~%,/|^@$\[\]]{1,400}")
+MISS_TTL = 600  # seconds to remember that Apple has no such page
+
+
+def _normalize_etag(etag: str) -> str:
+    """Same as scripts/apple_http.normalize_etag (which would pull in aiohttp)."""
+    etag = (etag or "").strip()
+    if etag.startswith("W/"):
+        etag = etag[2:]
+    return re.sub(r"-(df|gzip|br)$", "", etag.strip('"'))
+
+
+def _atomic_write(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+class OnDemandStore:
+    """Fetches pages from Apple's JSON API, converts them with the archive's own
+    converter and keeps them under ONDEMAND_DIR (raw-json/, markdown/, manifest.json)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.misses: dict[str, float] = {}
+        self._converter = None
+
+    @property
+    def manifest_path(self) -> Path:
+        return ONDEMAND_DIR / "manifest.json"
+
+    def _manifest(self) -> dict:
+        try:
+            return json.loads(self.manifest_path.read_text())
+        except (OSError, ValueError):
+            return {}
+
+    def converter(self):
+        if self._converter is None:
+            spec = importlib.util.spec_from_file_location(
+                "json_to_markdown", SCRIPT_DIR / "scripts" / "03_json_to_markdown.py")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            self._converter = module.AppleDocConverter(base_dir=ONDEMAND_DIR)
+        return self._converter
+
+    def _file_lock(self):
+        """Exclusive lock on ONDEMAND_DIR/.lock, shared with update_pull.py's import
+        (released by the OS if either process dies)."""
+        import contextlib
+        import fcntl
+
+        @contextlib.contextmanager
+        def held():
+            ONDEMAND_DIR.mkdir(parents=True, exist_ok=True)
+            with open(ONDEMAND_DIR / ".lock", "a") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                yield
+        return held()
+
+    def is_stale(self, doc_path: str) -> bool:
+        entry = self._manifest().get(doc_path)
+        if not entry:
+            return False
+        checked = entry.get("checked_at") or entry.get("downloaded_at") or ""
+        try:
+            return time.time() - datetime.fromisoformat(checked).timestamp() > ONDEMAND_MAX_AGE
+        except ValueError:
+            return True
+
+    def fetch(self, doc_path: str) -> tuple[Path | None, str | None]:
+        """Fetch (or revalidate) a page. Returns (markdown file, error message)."""
+        if not ONDEMAND or not doc_path:
+            return None, None
+        if not FETCHABLE.fullmatch(doc_path) or any(p in ("", ".", "..") for p in doc_path.split("/")):
+            return None, None
+        if time.time() - self.misses.get(doc_path, 0) < MISS_TTL:
+            return None, None
+        with self.lock, self._file_lock():
+            manifest = self._manifest()
+            entry = manifest.get(doc_path)
+            md_path = ONDEMAND_MD / f"{doc_path}.md"
+            raw_path = ONDEMAND_DIR / "raw-json" / f"{doc_path}.json"
+            url = API_BASE + urllib.parse.quote(doc_path, safe="/:()'!=&*+,-._~") + ".json"
+            headers = {"User-Agent": USER_AGENT}
+            if entry and entry.get("etag") and md_path.is_file() and raw_path.is_file():
+                headers["If-None-Match"] = f'"{_normalize_etag(entry["etag"])}"'
+            now = datetime.now().isoformat(timespec="seconds")
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as resp:
+                    body = resp.read()
+                    etag, last_modified = resp.headers.get("ETag"), resp.headers.get("Last-Modified")
+            except urllib.error.HTTPError as e:
+                if e.code == 304:
+                    entry["checked_at"] = now
+                    _atomic_write(self.manifest_path, json.dumps(manifest, indent=1).encode())
+                    return md_path, None
+                if e.code in (403, 404, 410):
+                    self.misses[doc_path] = time.time()
+                    return None, None
+                return None, f"developer.apple.com returned HTTP {e.code}"
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                return None, f"couldn't reach developer.apple.com ({getattr(e, 'reason', e)})"
+            try:
+                data = json.loads(body)
+                if not isinstance(data, dict) or "metadata" not in data:
+                    raise ValueError("not a documentation page")
+            except ValueError as e:
+                return None, f"unexpected response from developer.apple.com ({e})"
+
+            _atomic_write(raw_path, body)
+            conv = self.converter()
+            conv.current_doc_path = doc_path
+            conv.current_meta = {"downloaded_at": now}
+            try:
+                markdown = conv.convert_json_to_markdown(raw_path)
+            except Exception as e:
+                logger.exception("Converting on-demand page %s failed", doc_path)
+                return None, f"converting the page failed ({e!r})"
+            _atomic_write(md_path, markdown.encode("utf-8"))
+            manifest[doc_path] = {
+                "url": url, "local_path": f"raw-json/{doc_path}.json", "etag": etag,
+                "last_modified": last_modified, "downloaded_at": now, "checked_at": now,
+                "title": data.get("metadata", {}).get("title", ""),
+            }
+            _atomic_write(self.manifest_path, json.dumps(manifest, indent=1).encode())
+            logger.info("Fetched on demand: %s", doc_path)
+        index.upsert(doc_path, md_path)
+        return md_path, None
+
+
+ondemand = OnDemandStore()
+
+
+# ---------------------------------------------------------------------------
 # Search index (SQLite FTS5), built and refreshed in a background thread
 # ---------------------------------------------------------------------------
 SCHEMA_VERSION = 2
@@ -444,6 +623,37 @@ class SearchIndex:
             "deprecated": int(is_deprecated(meta)),
         }
 
+    def _upsert(self, con: sqlite3.Connection, doc_path: str, f: Path, mtime: float):
+        row = self._parse(f, doc_path)
+        for (old_id,) in con.execute("SELECT id FROM docs WHERE path=?", (doc_path,)).fetchall():
+            con.execute("DELETE FROM docs_fts WHERE rowid=?", (old_id,))
+            con.execute("DELETE FROM docs WHERE id=?", (old_id,))
+        cur = con.execute(
+            "INSERT INTO docs(path,parent,framework,name,stem,title,kind,role,abstract,deprecated,mtime)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (row["path"], row["parent"], row["framework"], row["name"], row["stem"],
+             row["title"], row["kind"], row["role"], row["abstract"], row["deprecated"], mtime))
+        words = camel_words(row["title"]) + " " + " ".join(re.findall(r"[a-z0-9]+", doc_path))
+        con.execute("INSERT INTO docs_fts(rowid,title,words,abstract,path) VALUES(?,?,?,?,?)",
+                    (cur.lastrowid, row["title"], words, row["abstract"], doc_path))
+
+    def upsert(self, doc_path: str, f: Path):
+        """Index one page now (an on-demand fetch). If a full refresh holds the
+        lock, skip: that refresh or the next one will pick the page up."""
+        if not self.ready or not self.lock.acquire(timeout=2):
+            return
+        try:
+            con = self._connect(readonly=False)
+            try:
+                self._upsert(con, doc_path, f, f.stat().st_mtime)
+                con.commit()
+            finally:
+                con.close()
+        except (sqlite3.Error, OSError):
+            logger.exception("Indexing on-demand page %s failed", doc_path)
+        finally:
+            self.lock.release()
+
     def refresh(self):
         """Bring the index up to date with the files on disk (incremental by mtime)."""
         if not MARKDOWN_DIR.is_dir():
@@ -459,34 +669,26 @@ class SearchIndex:
                 if known:
                     self.ready = True
                 on_disk: dict[str, tuple[Path, float]] = {}
-                for root, dirs, files in os.walk(MARKDOWN_DIR):
-                    dirs[:] = [d for d in dirs if not d.startswith(".")]
-                    for name in files:
-                        if name.endswith(".md"):
-                            p = Path(root, name)
-                            rel = os.path.relpath(p, MARKDOWN_DIR)[:-3].replace(os.sep, "/")
-                            on_disk[rel] = (p, p.stat().st_mtime)
+                for md_root in ROOTS:  # archive first: its copy of a page wins
+                    if not md_root.is_dir():
+                        continue
+                    for root, dirs, files in os.walk(md_root):
+                        dirs[:] = [d for d in dirs if not d.startswith(".")]
+                        for name in files:
+                            if name.endswith(".md"):
+                                p = Path(root, name)
+                                rel = os.path.relpath(p, md_root)[:-3].replace(os.sep, "/")
+                                if rel not in on_disk:
+                                    on_disk[rel] = (p, p.stat().st_mtime)
                 changed = [k for k, (_, m) in on_disk.items() if k not in known or known[k][1] != m]
                 removed = [k for k in known if k not in on_disk]
                 total = len(changed)
                 for i, doc_path in enumerate(changed, 1):
                     f, mtime = on_disk[doc_path]
                     try:
-                        row = self._parse(f, doc_path)
+                        self._upsert(con, doc_path, f, mtime)
                     except OSError:
                         continue
-                    if doc_path in known:
-                        old_id = known[doc_path][0]
-                        con.execute("DELETE FROM docs_fts WHERE rowid=?", (old_id,))
-                        con.execute("DELETE FROM docs WHERE id=?", (old_id,))
-                    cur = con.execute(
-                        "INSERT INTO docs(path,parent,framework,name,stem,title,kind,role,abstract,deprecated,mtime)"
-                        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                        (row["path"], row["parent"], row["framework"], row["name"], row["stem"],
-                         row["title"], row["kind"], row["role"], row["abstract"], row["deprecated"], mtime))
-                    words = camel_words(row["title"]) + " " + " ".join(re.findall(r"[a-z0-9]+", doc_path))
-                    con.execute("INSERT INTO docs_fts(rowid,title,words,abstract,path) VALUES(?,?,?,?,?)",
-                                (cur.lastrowid, row["title"], words, row["abstract"], doc_path))
                     if i % 5000 == 0:
                         con.commit()
                         self.status = f"indexing: {i:,} of {total:,} changed pages"
@@ -854,14 +1056,17 @@ def search_all_frameworks(
 # ---------------------------------------------------------------------------
 # Tool: read a document
 # ---------------------------------------------------------------------------
-def doc_header(doc_path: str, meta: dict) -> list[str]:
+def doc_header(doc_path: str, meta: dict, fetched_on_demand: bool = False) -> list[str]:
     title = meta.get("title") or doc_path
     kind = meta.get("roleHeading") or meta.get("role") or ""
     modules = ", ".join(m.get("name", "") for m in meta.get("modules") or [] if isinstance(m, dict))
     desc = ", ".join(x for x in (kind, modules) if x)
     lines = [f"Document: {doc_path} — {title}" + (f" ({desc})" if desc else "")]
     src = meta.get("url") or DOCS_SITE + doc_path
-    lines.append(f"Source: {src}" + (f" (fetched {meta['fetched']})" if meta.get("fetched") else ""))
+    fetched = f"fetched {meta['fetched']}" if meta.get("fetched") else ""
+    if fetched_on_demand:
+        fetched = (fetched + ", " if fetched else "") + "fetched on demand; not part of the archive"
+    lines.append(f"Source: {src}" + (f" ({fetched})" if fetched else ""))
     avail = format_availability(meta)
     if avail:
         lines.append("Availability: " + "; ".join(avail))
@@ -884,7 +1089,8 @@ def read_document(
     """Read a documentation page. The reply starts with title, kind, source URL,
     availability and deprecation, then the page with line numbers. Links in the
     page are rewritten: archive pages appear as paths you can pass straight back
-    to read_document; https:// links are pages that aren't in the archive.
+    to read_document; developer.apple.com links are pages that aren't in the
+    archive. Pass those to read_document too: it fetches them from Apple on demand.
 
     Args:
         path: The page: an archive path ('appkit/nsview' or 'appkit/nsview.md'), a doc:// identifier,
@@ -912,7 +1118,7 @@ def read_document(
     start, end = offset - 1, min(offset - 1 + limit, total)
     selected = rewrite_doc_lines(all_lines[start:end], doc_path, in_fence_at(all_lines, start))
     numbered = [f"{i:>5} | {line}" for i, line in enumerate(selected, start=offset)]
-    header = doc_header(doc_path, meta)
+    header = doc_header(doc_path, meta, is_ondemand(f))
     header.append(f"Lines {offset}-{end} of {total}" + (f" (use offset={end + 1} to continue)" if end < total else ""))
     return "\n".join(header) + "\n\n" + "\n".join(numbered)
 
@@ -996,7 +1202,7 @@ def get_symbol_info(path: str) -> str:
     except Exception as e:
         return f"Error reading file: {e}"
     body = "\n".join(text.splitlines()[fm_lines:])
-    lines = doc_header(doc_path, meta)
+    lines = doc_header(doc_path, meta, is_ondemand(f))
     abstract = meta.get("abstract") or first_paragraph(body)
     if abstract:
         lines.append(f"Summary: {abstract}")

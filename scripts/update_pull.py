@@ -14,6 +14,9 @@ from typing import Dict, List
 from tqdm import tqdm
 import argparse
 from datetime import datetime
+import fcntl
+import os
+import shutil
 import subprocess
 import sys
 
@@ -63,6 +66,72 @@ class UpdatePuller:
         with open(tmp, 'w') as f:
             json.dump(self.manifest, f, indent=2)
         tmp.replace(self.manifest_file)  # atomic: a kill mid-save can't truncate the manifest
+
+    def import_ondemand(self, ondemand_dir: Path) -> int:
+        """Move pages the MCP server fetched on demand into the archive.
+
+        The server keeps them in ondemand_dir (raw-json/, markdown/, manifest.json)
+        because only one process may write .docsync/manifest.json. Importing here
+        makes them ordinary archive pages that update_check / update_pull track.
+        Holds ondemand_dir/.lock (also taken by the server while fetching).
+        Returns the number of pages imported.
+        """
+        od_manifest_file = ondemand_dir / 'manifest.json'
+        if not od_manifest_file.exists():
+            return 0
+        self.load_manifest()
+        imported = dropped = 0
+        with open(ondemand_dir / '.lock', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            od_manifest = json.loads(od_manifest_file.read_text())
+            for doc_path, entry in list(od_manifest.items()):
+                raw_src = ondemand_dir / 'raw-json' / f'{doc_path}.json'
+                md_src = ondemand_dir / 'markdown' / f'{doc_path}.md'
+                if doc_path in self.manifest:
+                    dropped += 1  # the archive already has it; its copy wins
+                elif raw_src.is_file():
+                    content = raw_src.read_text(encoding='utf-8')
+                    metadata = json.loads(content).get('metadata', {})
+                    raw_dst = self.raw_json_dir / f'{doc_path}.json'
+                    raw_dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(raw_src, raw_dst)
+                    if md_src.is_file():
+                        md_dst = self.markdown_dir / f'{doc_path}.md'
+                        md_dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(md_src, md_dst)
+                    self.manifest[doc_path] = {
+                        'url': entry.get('url') or f'https://developer.apple.com/tutorials/data/documentation/{doc_path}.json',
+                        'local_path': f'raw-json/{doc_path}.json',
+                        'last_modified': entry.get('last_modified') or '',
+                        'etag': entry.get('etag') or '',
+                        'sha256': self.calculate_sha256(content),
+                        'downloaded_at': entry.get('downloaded_at') or datetime.now().isoformat(),
+                        'title': metadata.get('title', ''),
+                        'role': metadata.get('role', ''),
+                        'source': 'ondemand',
+                    }
+                    imported += 1
+                else:
+                    dropped += 1  # manifest entry without its file
+                # Save the archive manifest before forgetting the page, so an
+                # interruption can only leave a page in both places, never neither
+                if (imported + dropped) % 200 == 0:
+                    self.save_manifest()
+            self.save_manifest()
+            for doc_path in od_manifest:
+                for f in (ondemand_dir / 'raw-json' / f'{doc_path}.json',
+                          ondemand_dir / 'markdown' / f'{doc_path}.md'):
+                    try:
+                        f.unlink()
+                    except FileNotFoundError:
+                        pass
+            tmp = od_manifest_file.with_suffix('.json.tmp')
+            tmp.write_text('{}')
+            os.replace(tmp, od_manifest_file)
+        if imported or dropped:
+            print(f"Imported {imported} on-demand pages into the archive"
+                  + (f" ({dropped} already present or missing, discarded)" if dropped else ""))
+        return imported
 
     def load_latest_update_check(self) -> Dict:
         """Load the most recent update check results"""
@@ -268,12 +337,19 @@ async def main():
     parser.add_argument('--frameworks', nargs='+', help='Frameworks to update (default: all)')
     parser.add_argument('--base-dir', default='.', help='Base directory (default: project directory)')
     parser.add_argument('--no-convert', action='store_true', help='Skip Markdown conversion')
+    parser.add_argument('--ondemand-dir', help='Pages fetched on demand by the MCP server, imported into '
+                        'the archive before pulling (default: <base-dir>/.ondemand)')
+    parser.add_argument('--no-import', action='store_true', help="Don't import on-demand pages")
 
     args = parser.parse_args()
 
     base_dir = Path(__file__).parent.parent / args.base_dir if args.base_dir == '.' else Path(args.base_dir)
 
     puller = UpdatePuller(base_dir=base_dir)
+
+    # Adopt pages the MCP server fetched on demand
+    if not args.no_import:
+        puller.import_ondemand(Path(args.ondemand_dir) if args.ondemand_dir else base_dir / '.ondemand')
 
     # Pull updates
     await puller.pull_updates(frameworks=args.frameworks)
