@@ -555,7 +555,8 @@ class DocumentationCrawler:
 
         # Apple doc URLs are case-insensitive and canonically lowercase; without this,
         # doc:// refs (CamelCase) and url refs (lowercase) produce duplicate pages.
-        return identifier.lower()
+        # Drop in-page anchors (#section): they're the same page, and the .json URL 404s
+        return identifier.split('#', 1)[0].lower()
 
     def extract_references_from_json(self, data: dict, base_path: str) -> Set[str]:
         """Extract all documentation references from JSON data"""
