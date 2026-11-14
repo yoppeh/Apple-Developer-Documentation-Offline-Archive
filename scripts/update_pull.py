@@ -24,13 +24,16 @@ class RateLimiter:
     def __init__(self, requests_per_second: float = 5.0):
         self.delay = 1.0 / requests_per_second
         self.last_request = 0.0
+        # Serialize callers; otherwise concurrent tasks all pass the check at once
+        self._lock = asyncio.Lock()
 
     async def wait(self):
-        now = time.time()
-        time_since_last = now - self.last_request
-        if time_since_last < self.delay:
-            await asyncio.sleep(self.delay - time_since_last)
-        self.last_request = time.time()
+        async with self._lock:
+            now = time.time()
+            time_since_last = now - self.last_request
+            if time_since_last < self.delay:
+                await asyncio.sleep(self.delay - time_since_last)
+            self.last_request = time.time()
 
 
 class UpdatePuller:
@@ -46,6 +49,7 @@ class UpdatePuller:
         # State
         self.manifest: Dict = {}
         self.pages_to_update: List[Dict] = []
+        self.updated_paths: List[str] = []
 
         # Stats
         self.stats = {
@@ -71,8 +75,10 @@ class UpdatePuller:
 
     def save_manifest(self):
         """Save updated manifest"""
-        with open(self.manifest_file, 'w') as f:
+        tmp = self.manifest_file.with_suffix('.json.tmp')
+        with open(tmp, 'w') as f:
             json.dump(self.manifest, f, indent=2)
+        tmp.replace(self.manifest_file)  # atomic: a kill mid-save can't truncate the manifest
 
     def load_latest_update_check(self) -> Dict:
         """Load the most recent update check results"""
@@ -123,6 +129,7 @@ class UpdatePuller:
                     self.manifest[doc_path]['sha256'] = self.calculate_sha256(content)
                     self.manifest[doc_path]['updated_at'] = datetime.now().isoformat()
 
+                    self.updated_paths.append(doc_path)
                     self.stats['downloaded'] += 1
                     return True
 
@@ -147,7 +154,15 @@ class UpdatePuller:
 
         # Load latest update check
         update_check = self.load_latest_update_check()
-        self.pages_to_update = update_check['updates']['modified']
+        # Normalize to lowercase (Apple paths are case-insensitive) and dedupe,
+        # so CamelCase entries in older caches don't recreate duplicate pages
+        seen = set()
+        self.pages_to_update = []
+        for p in update_check['updates']['modified']:
+            p = {**p, 'path': p['path'].lower()}
+            if p['path'] in self.manifest and p['path'] not in seen:
+                seen.add(p['path'])
+                self.pages_to_update.append(p)
 
         # Filter by frameworks if specified
         if frameworks:
@@ -194,12 +209,14 @@ class UpdatePuller:
             print("Warning: Markdown converter not found. Skipping conversion.")
             return
 
-        # Run converter for each updated page
-        # For simplicity, we'll just run the full converter
-        # In a production system, you'd want to convert only updated pages
+        # Convert only the pages that were downloaded
+        pages_file = self.docsync_dir / 'cache' / 'pulled_pages.txt'
+        pages_file.parent.mkdir(parents=True, exist_ok=True)
+        pages_file.write_text('\n'.join(self.updated_paths) + '\n')
         try:
             result = subprocess.run(
-                [sys.executable, str(converter_script), '--base-dir', str(self.base_dir)],
+                [sys.executable, str(converter_script), '--base-dir', str(self.base_dir),
+                 '--pages-file', str(pages_file)],
                 capture_output=True,
                 text=True
             )

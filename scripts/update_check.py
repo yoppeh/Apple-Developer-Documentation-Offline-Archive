@@ -13,6 +13,17 @@ from typing import Dict, Set
 from tqdm import tqdm
 import argparse
 from datetime import datetime
+import re
+
+
+def normalize_etag(etag: str) -> str:
+    """Strip weak prefix, quotes and compression suffixes (-df, -gzip, -br) Apache adds
+    depending on Accept-Encoding, so GET (stored) and HEAD (checked) ETags compare equal."""
+    etag = (etag or '').strip()
+    if etag.startswith('W/'):
+        etag = etag[2:]
+    etag = etag.strip('"')
+    return re.sub(r'-(df|gzip|br)$', '', etag)
 
 
 class RateLimiter:
@@ -23,13 +34,16 @@ class RateLimiter:
         self.delay = 1.0 / requests_per_second
         self.last_request = 0.0
         self.time = time
+        # Serialize callers; otherwise concurrent tasks all pass the check at once
+        self._lock = asyncio.Lock()
 
     async def wait(self):
-        now = self.time.time()
-        time_since_last = now - self.last_request
-        if time_since_last < self.delay:
-            await asyncio.sleep(self.delay - time_since_last)
-        self.last_request = self.time.time()
+        async with self._lock:
+            now = self.time.time()
+            time_since_last = now - self.last_request
+            if time_since_last < self.delay:
+                await asyncio.sleep(self.delay - time_since_last)
+            self.last_request = self.time.time()
 
 
 class UpdateChecker:
@@ -75,7 +89,7 @@ class UpdateChecker:
             async with session.head(url, headers=headers) as response:
                 if response.status == 200:
                     new_etag = response.headers.get('ETag', '')
-                    if new_etag and new_etag != current_etag:
+                    if new_etag and normalize_etag(new_etag) != normalize_etag(current_etag):
                         return 'modified'
                     else:
                         return 'unchanged'

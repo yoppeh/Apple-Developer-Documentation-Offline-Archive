@@ -22,13 +22,16 @@ class RateLimiter:
     def __init__(self, requests_per_second: float = 5.0):
         self.delay = 1.0 / requests_per_second
         self.last_request = 0.0
+        # Serialize callers; otherwise concurrent tasks all pass the check at once
+        self._lock = asyncio.Lock()
 
     async def wait(self):
-        now = time.time()
-        time_since_last = now - self.last_request
-        if time_since_last < self.delay:
-            await asyncio.sleep(self.delay - time_since_last)
-        self.last_request = time.time()
+        async with self._lock:
+            now = time.time()
+            time_since_last = now - self.last_request
+            if time_since_last < self.delay:
+                await asyncio.sleep(self.delay - time_since_last)
+            self.last_request = time.time()
 
 
 class DocumentationDownloader:
@@ -80,8 +83,10 @@ class DocumentationDownloader:
     def save_manifest(self):
         """Save manifest to disk"""
         manifest_file = self.docsync_dir / 'manifest.json'
-        with open(manifest_file, 'w') as f:
+        tmp = manifest_file.with_suffix('.json.tmp')
+        with open(tmp, 'w') as f:
             json.dump(self.manifest, f, indent=2)
+        tmp.replace(manifest_file)  # atomic: a kill mid-save can't truncate the manifest
 
     def calculate_sha256(self, content: str) -> str:
         """Calculate SHA256 hash of content"""
@@ -163,6 +168,10 @@ class DocumentationDownloader:
             # Download all frameworks
             for framework_pages in index['frameworks'].values():
                 pages_to_download.extend(framework_pages)
+
+        # Apple doc paths are case-insensitive; normalize so older indexes
+        # (with CamelCase doc:// paths) don't create duplicate pages
+        pages_to_download = list(dict.fromkeys(p.lower() for p in pages_to_download))
 
         # Filter out already downloaded (if resuming)
         if self.manifest:

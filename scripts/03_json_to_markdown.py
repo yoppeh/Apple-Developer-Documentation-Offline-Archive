@@ -10,7 +10,21 @@ from pathlib import Path
 from typing import Dict, List, Any
 from tqdm import tqdm
 import argparse
+import os
 import re
+
+
+def normalize_doc_path(identifier: str) -> str:
+    """Map a doc:// identifier or /documentation/ URL to the archive's lowercase doc path.
+
+    doc://com.apple.Swift/documentation/Swift/String -> swift/string
+    """
+    path = identifier
+    if path.startswith('doc://'):
+        path = path.split('/documentation/', 1)[1] if '/documentation/' in path else ''
+    elif path.startswith('/documentation/'):
+        path = path[len('/documentation/'):]
+    return path.split('#', 1)[0].strip('/').lower()
 
 
 class AppleDocConverter:
@@ -26,6 +40,9 @@ class AppleDocConverter:
         self.markdown_dir.mkdir(parents=True, exist_ok=True)
 
         # Stats
+        # Doc path of the page being converted (for relative links)
+        self.current_doc_path = ''
+
         self.stats = {
             'converted': 0,
             'failed': 0,
@@ -180,6 +197,14 @@ class AppleDocConverter:
             return text.replace('\n\n', ' ').strip()
         return text
 
+    def doc_link(self, identifier: str) -> str:
+        """Relative Markdown link from the current page to the page for identifier"""
+        target = normalize_doc_path(identifier) + '.md'
+        if not self.current_doc_path:
+            return target
+        start = os.path.dirname(self.current_doc_path) or '.'
+        return os.path.relpath(target, start)
+
     def convert_topics(self, topic_sections: List[Dict]) -> str:
         """Convert topic sections to Markdown"""
         if not topic_sections:
@@ -194,10 +219,9 @@ class AppleDocConverter:
             if identifiers:
                 result.append(f"### {title}\n\n")
                 for identifier in identifiers:
-                    # Create relative link
-                    link = identifier.replace('doc://', '').replace('documentation/', '')
+                    link = self.doc_link(identifier)
                     title_text = identifier.split('/')[-1]
-                    result.append(f"- [{title_text}](../{link}.md)\n")
+                    result.append(f"- [{title_text}]({link})\n")
                 result.append('\n')
 
         return ''.join(result)
@@ -289,22 +313,23 @@ class AppleDocConverter:
             for section in see_also:
                 identifiers = section.get('identifiers', [])
                 for identifier in identifiers:
-                    link = identifier.replace('doc://', '').replace('documentation/', '')
+                    link = self.doc_link(identifier)
                     title_text = identifier.split('/')[-1]
-                    markdown += f"- [{title_text}](../{link}.md)\n"
+                    markdown += f"- [{title_text}]({link})\n"
             markdown += '\n'
 
         return markdown
 
-    def convert_all(self, frameworks: List[str] = None):
-        """Convert all JSON files to Markdown"""
+    def convert_all(self, frameworks: List[str] = None, pages: List[str] = None):
+        """Convert all JSON files (or just the given frameworks / doc paths) to Markdown"""
         manifest = self.load_manifest()
 
-        # Filter by frameworks if specified
-        if frameworks:
+        if pages is not None:
+            pages_to_convert = {p: manifest[p] for p in pages if p in manifest}
+        elif frameworks:
             pages_to_convert = {
                 k: v for k, v in manifest.items()
-                if any(k.startswith(f'{fw}/') for fw in frameworks)
+                if any(k == fw or k.startswith(f'{fw}/') for fw in frameworks)
             }
         else:
             pages_to_convert = manifest
@@ -323,6 +348,7 @@ class AppleDocConverter:
                         continue
 
                     # Convert to Markdown
+                    self.current_doc_path = doc_path
                     markdown = self.convert_json_to_markdown(json_path)
 
                     # Save Markdown file
@@ -353,6 +379,7 @@ def main():
     parser = argparse.ArgumentParser(description='Convert Apple documentation JSON to Markdown')
     parser.add_argument('--frameworks', nargs='+', help='Frameworks to convert (default: all)')
     parser.add_argument('--base-dir', default='.', help='Base directory (default: project directory)')
+    parser.add_argument('--pages-file', help='Only convert the doc paths listed in this file (one per line)')
 
     args = parser.parse_args()
 
@@ -366,7 +393,11 @@ def main():
         return
 
     converter = AppleDocConverter(base_dir=base_dir)
-    converter.convert_all(frameworks=args.frameworks)
+    pages = None
+    if args.pages_file:
+        with open(args.pages_file) as f:
+            pages = [line.strip() for line in f if line.strip()]
+    converter.convert_all(frameworks=args.frameworks, pages=pages)
 
     print("\nConversion complete!")
     print(f"Markdown files saved to: {converter.markdown_dir}")
