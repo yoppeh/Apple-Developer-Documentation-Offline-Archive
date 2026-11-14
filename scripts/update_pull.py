@@ -17,23 +17,7 @@ from datetime import datetime
 import subprocess
 import sys
 
-
-class RateLimiter:
-    """Rate limiter to avoid overwhelming Apple's servers"""
-
-    def __init__(self, requests_per_second: float = 5.0):
-        self.delay = 1.0 / requests_per_second
-        self.last_request = 0.0
-        # Serialize callers; otherwise concurrent tasks all pass the check at once
-        self._lock = asyncio.Lock()
-
-    async def wait(self):
-        async with self._lock:
-            now = time.time()
-            time_since_last = now - self.last_request
-            if time_since_last < self.delay:
-                await asyncio.sleep(self.delay - time_since_last)
-            self.last_request = time.time()
+from apple_http import AdaptiveRateLimiter, fetch
 
 
 class UpdatePuller:
@@ -59,7 +43,7 @@ class UpdatePuller:
         }
 
         # Rate limiting
-        self.rate_limiter = RateLimiter(requests_per_second=5.0)
+        self.rate_limiter = AdaptiveRateLimiter(rate=10.0, max_rate=15.0)
 
         # User agent
         self.user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
@@ -104,49 +88,32 @@ class UpdatePuller:
 
     async def download_page(self, session: aiohttp.ClientSession, page_info: Dict) -> bool:
         """Download a single updated page"""
-        await self.rate_limiter.wait()
-
         doc_path = page_info['path']
         url = f'https://developer.apple.com/tutorials/data/documentation/{doc_path}.json'
-        headers = {'User-Agent': self.user_agent}
-
-        try:
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    data = json.loads(content)
-
-                    # Save JSON file
-                    output_file = self.raw_json_dir / f'{doc_path}.json'
-                    output_file.parent.mkdir(parents=True, exist_ok=True)
-
-                    with open(output_file, 'w') as f:
-                        json.dump(data, f, indent=2)
-
-                    # Update manifest
-                    self.manifest[doc_path]['last_modified'] = response.headers.get('Last-Modified', '')
-                    self.manifest[doc_path]['etag'] = response.headers.get('ETag', '')
-                    self.manifest[doc_path]['sha256'] = self.calculate_sha256(content)
-                    self.manifest[doc_path]['updated_at'] = datetime.now().isoformat()
-
-                    self.updated_paths.append(doc_path)
-                    self.stats['downloaded'] += 1
-                    return True
-
-                elif response.status == 429:
-                    print(f"\nRate limited. Waiting 30 seconds...")
-                    await asyncio.sleep(30)
-                    return await self.download_page(session, page_info)
-
-                else:
-                    print(f"\nError {response.status}: {url}")
-                    self.stats['failed'] += 1
-                    return False
-
-        except Exception as e:
-            print(f"\nException downloading {doc_path}: {e}")
+        result = await fetch(session, self.rate_limiter, url, self.user_agent)
+        if result is None or result[0] != 200:
+            if result is not None:
+                print(f"\nError {result[0]}: {url}")
             self.stats['failed'] += 1
             return False
+        _, content, headers = result
+        data = json.loads(content)
+
+        # Save JSON file
+        output_file = self.raw_json_dir / f'{doc_path}.json'
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, 'w') as f:
+            json.dump(data, f, indent=2)
+
+        # Update manifest
+        self.manifest[doc_path]['last_modified'] = headers.get('Last-Modified', '')
+        self.manifest[doc_path]['etag'] = headers.get('ETag', '')
+        self.manifest[doc_path]['sha256'] = self.calculate_sha256(content)
+        self.manifest[doc_path]['updated_at'] = datetime.now().isoformat()
+
+        self.updated_paths.append(doc_path)
+        self.stats['downloaded'] += 1
+        return True
 
     async def pull_updates(self, frameworks: list = None):
         """Pull all available updates"""

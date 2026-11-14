@@ -13,37 +13,8 @@ from typing import Dict, Set
 from tqdm import tqdm
 import argparse
 from datetime import datetime
-import re
 
-
-def normalize_etag(etag: str) -> str:
-    """Strip weak prefix, quotes and compression suffixes (-df, -gzip, -br) Apache adds
-    depending on Accept-Encoding, so GET (stored) and HEAD (checked) ETags compare equal."""
-    etag = (etag or '').strip()
-    if etag.startswith('W/'):
-        etag = etag[2:]
-    etag = etag.strip('"')
-    return re.sub(r'-(df|gzip|br)$', '', etag)
-
-
-class RateLimiter:
-    """Rate limiter to avoid overwhelming Apple's servers"""
-
-    def __init__(self, requests_per_second: float = 10.0):
-        import time
-        self.delay = 1.0 / requests_per_second
-        self.last_request = 0.0
-        self.time = time
-        # Serialize callers; otherwise concurrent tasks all pass the check at once
-        self._lock = asyncio.Lock()
-
-    async def wait(self):
-        async with self._lock:
-            now = self.time.time()
-            time_since_last = now - self.last_request
-            if time_since_last < self.delay:
-                await asyncio.sleep(self.delay - time_since_last)
-            self.last_request = self.time.time()
+from apple_http import AdaptiveRateLimiter, fetch, normalize_etag
 
 
 class UpdateChecker:
@@ -63,7 +34,7 @@ class UpdateChecker:
         }
 
         # Rate limiting
-        self.rate_limiter = RateLimiter(requests_per_second=10.0)
+        self.rate_limiter = AdaptiveRateLimiter(rate=10.0, max_rate=15.0)
 
         # User agent
         self.user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
@@ -79,28 +50,20 @@ class UpdateChecker:
             self.manifest = json.load(f)
 
     async def check_page_etag(self, session: aiohttp.ClientSession, doc_path: str, current_etag: str) -> str:
-        """Check if a page has been updated using ETag"""
-        await self.rate_limiter.wait()
-
+        """Check if a page has been updated using ETag (HEAD request only)"""
         url = f'https://developer.apple.com/tutorials/data/documentation/{doc_path}.json'
-        headers = {'User-Agent': self.user_agent}
-
-        try:
-            async with session.head(url, headers=headers) as response:
-                if response.status == 200:
-                    new_etag = response.headers.get('ETag', '')
-                    if new_etag and normalize_etag(new_etag) != normalize_etag(current_etag):
-                        return 'modified'
-                    else:
-                        return 'unchanged'
-                elif response.status == 404:
-                    return 'deleted'
-                else:
-                    return 'unknown'
-
-        except Exception as e:
-            print(f"\nError checking {doc_path}: {e}")
+        result = await fetch(session, self.rate_limiter, url, self.user_agent, method='HEAD')
+        if result is None:
             return 'error'
+        status, _, headers = result
+        if status == 200:
+            new_etag = headers.get('ETag', '')
+            if new_etag and normalize_etag(new_etag) != normalize_etag(current_etag):
+                return 'modified'
+            return 'unchanged'
+        if status == 404:
+            return 'deleted'
+        return 'unknown'
 
     async def check_all_pages(self, frameworks: list = None):
         """Check all pages for updates"""

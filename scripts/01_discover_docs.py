@@ -15,6 +15,8 @@ from typing import Set, Dict, List
 from tqdm import tqdm
 import argparse
 
+from apple_http import AdaptiveRateLimiter, fetch
+
 
 # Framework root URLs
 FRAMEWORK_ROOTS = {
@@ -423,30 +425,18 @@ FRAMEWORK_ROOTS = {
 }
 
 
-class RateLimiter:
-    """Rate limiter to avoid overwhelming Apple's servers"""
-
-    def __init__(self, requests_per_second: float = 5.0):
-        self.delay = 1.0 / requests_per_second
-        self.last_request = 0.0
-        # Serialize callers; otherwise concurrent tasks all pass the check at once
-        self._lock = asyncio.Lock()
-
-    async def wait(self):
-        async with self._lock:
-            now = time.time()
-            time_since_last = now - self.last_request
-            if time_since_last < self.delay:
-                await asyncio.sleep(self.delay - time_since_last)
-            self.last_request = time.time()
-
-
 class DocumentationCrawler:
     """Crawls Apple's documentation API to discover all pages"""
 
-    def __init__(self, output_dir: Path, frameworks: List[str] = None, base_dir: Path = None):
+    def __init__(self, output_dir: Path, frameworks: List[str] = None, base_dir: Path = None,
+                 reuse_from: Path = None):
         self.output_dir = Path(output_dir)
         self.frameworks = frameworks or list(FRAMEWORK_ROOTS.keys())
+
+        # Prior archive to reuse: pages are requested with If-None-Match and, on a 304,
+        # copied from the old raw JSON instead of being downloaded again
+        self.reuse: Dict[str, dict] = {}
+        self.stats = {'fetched': 0, 'reused': 0}
 
         # Pages are saved as they are crawled, so 02_download_json.py has nothing left to fetch
         self.base_dir = Path(base_dir) if base_dir else self.output_dir
@@ -457,6 +447,8 @@ class DocumentationCrawler:
             with open(self.manifest_file) as f:
                 self.manifest = json.load(f)
         self.last_save = time.time()
+        if reuse_from:
+            self.load_reuse(Path(reuse_from))
 
         # State tracking
         self.discovered_urls: Set[str] = set()
@@ -467,10 +459,30 @@ class DocumentationCrawler:
         self.pbar = None
 
         # Rate limiting
-        self.rate_limiter = RateLimiter(requests_per_second=5.0)
+        self.rate_limiter = AdaptiveRateLimiter(rate=10.0, max_rate=15.0)
 
         # User agent
         self.user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+
+    def load_reuse(self, reuse_dir: Path):
+        """Index a prior archive's manifest by lowercase doc path (newest entry wins)"""
+        manifest_file = reuse_dir / '.docsync' / 'manifest.json'
+        if not manifest_file.exists():
+            print(f"Warning: no manifest to reuse at {manifest_file}")
+            return
+        with open(manifest_file) as f:
+            old = json.load(f)
+        wanted = set(self.frameworks)
+        for key, entry in old.items():
+            low = key.lower()
+            if low.split('/')[0] not in wanted or not entry.get('etag'):
+                continue
+            stamp = entry.get('updated_at') or entry.get('downloaded_at') or ''
+            prev = self.reuse.get(low)
+            if prev and prev['_stamp'] >= stamp:
+                continue
+            self.reuse[low] = {**entry, '_src': str(reuse_dir / entry['local_path']), '_stamp': stamp}
+        print(f"Reusing up to {len(self.reuse)} pages from {reuse_dir}")
 
     def save_manifest(self):
         """Atomically save the manifest (a kill mid-save can't truncate it)"""
@@ -488,8 +500,10 @@ class DocumentationCrawler:
             'processed_urls': list(self.processed_urls),
             'url_metadata': self.url_metadata,
         }
-        with open(state_file, 'w') as f:
+        tmp = state_file.with_suffix('.json.tmp')
+        with open(tmp, 'w') as f:
             json.dump(state, f, indent=2)
+        tmp.replace(state_file)  # atomic, so an interrupted crawl can always --resume
 
     def load_state(self):
         """Load previous discovery state for resume"""
@@ -578,31 +592,21 @@ class DocumentationCrawler:
 
         return references
 
-    async def fetch_json(self, session: aiohttp.ClientSession, url: str):
-        """Fetch JSON from URL with rate limiting. Returns (data, raw_text, headers) or None"""
-        await self.rate_limiter.wait()
-
-        headers = {'User-Agent': self.user_agent}
-
-        try:
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    text = await response.text()
-                    return json.loads(text), text, response.headers
-                elif response.status == 404:
-                    print(f"\nWarning: 404 Not Found: {url}")
-                    return None
-                elif response.status == 429:
-                    # Rate limited - wait and retry
-                    print(f"\nRate limited. Waiting 10 seconds...")
-                    await asyncio.sleep(10)
-                    return await self.fetch_json(session, url)
-                else:
-                    print(f"\nError {response.status} fetching {url}")
-                    return None
-        except Exception as e:
-            print(f"\nException fetching {url}: {e}")
+    async def fetch_json(self, session: aiohttp.ClientSession, url: str, etag: str = None):
+        """Fetch a page. Returns (status, data, raw_text, headers) for 200/304, else None"""
+        result = await fetch(session, self.rate_limiter, url, self.user_agent, etag=etag)
+        if result is None:
             return None
+        status, text, headers = result
+        if status == 200:
+            return status, json.loads(text), text, headers
+        if status == 304:
+            return status, None, None, headers
+        if status == 404:
+            print(f"\nWarning: 404 Not Found: {url}")
+        else:
+            print(f"\nError {status} fetching {url}")
+        return None
 
     async def crawl_page(self, session: aiohttp.ClientSession, doc_path: str) -> Set[str]:
         """Crawl a single documentation page and extract references"""
@@ -611,27 +615,47 @@ class DocumentationCrawler:
 
         url = f'https://developer.apple.com/tutorials/data/documentation/{doc_path}.json'
 
-        result = await self.fetch_json(session, url)
+        # Conditional request when we already hold a copy of this page
+        prior = self.reuse.get(doc_path)
+        if prior and not Path(prior['_src']).exists():
+            prior = None
+        result = await self.fetch_json(session, url, etag=prior['etag'] if prior else None)
         if not result:
             self.processed_urls.add(doc_path)
             return set()
-        data, text, resp_headers = result
+        status, data, text, resp_headers = result
 
-        # Save the page now instead of fetching it again in a separate download step
         output_file = self.raw_json_dir / f'{doc_path}.json'
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        self.manifest[doc_path] = {
-            'url': url,
-            'local_path': str(output_file.relative_to(self.base_dir)),
-            'last_modified': resp_headers.get('Last-Modified', ''),
-            'etag': resp_headers.get('ETag', ''),
-            'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest(),
-            'downloaded_at': datetime.now().isoformat(),
-            'title': data.get('metadata', {}).get('title', ''),
-            'role': data.get('metadata', {}).get('role', ''),
-        }
+        if status == 304:
+            # Unchanged: copy the prior JSON and keep its manifest entry
+            with open(prior['_src']) as f:
+                data = json.load(f)
+            with open(output_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            entry = {k: v for k, v in prior.items() if not k.startswith('_')}
+            entry.update({
+                'url': url,
+                'local_path': str(output_file.relative_to(self.base_dir)),
+                'verified_at': datetime.now().isoformat(),
+            })
+            self.manifest[doc_path] = entry
+            self.stats['reused'] += 1
+        else:
+            # Save the page now instead of fetching it again in a separate download step
+            with open(output_file, 'w') as f:
+                json.dump(data, f, indent=2)
+            self.manifest[doc_path] = {
+                'url': url,
+                'local_path': str(output_file.relative_to(self.base_dir)),
+                'last_modified': resp_headers.get('Last-Modified', ''),
+                'etag': resp_headers.get('ETag', ''),
+                'sha256': hashlib.sha256(text.encode('utf-8')).hexdigest(),
+                'downloaded_at': datetime.now().isoformat(),
+                'title': data.get('metadata', {}).get('title', ''),
+                'role': data.get('metadata', {}).get('role', ''),
+            }
+            self.stats['fetched'] += 1
 
         # Store metadata
         self.url_metadata[doc_path] = {
@@ -741,6 +765,8 @@ class DocumentationCrawler:
         print(f"\nIndex saved to {index_file}")
         print(f"Total pages discovered: {len(self.discovered_urls)}")
         print(f"Total processed: {len(self.processed_urls)}")
+        print(f"Downloaded: {self.stats['fetched']}, reused unchanged (304): {self.stats['reused']}, "
+              f"final rate: {self.rate_limiter.rate:.1f} req/s")
 
         # Print framework breakdown
         print("\nFramework breakdown:")
@@ -753,6 +779,8 @@ async def main():
     parser.add_argument('--frameworks', nargs='+', help='Frameworks to crawl (default: all)')
     parser.add_argument('--output', default='.', help='Directory for index.json and discovery state (default: project directory)')
     parser.add_argument('--base-dir', default=None, help='Archive directory for raw-json/ and .docsync/ (default: --output)')
+    parser.add_argument('--reuse-from', default=None,
+                        help='Prior archive directory; unchanged pages (HTTP 304) are copied from it instead of downloaded')
     parser.add_argument('--resume', action='store_true', help='Resume from previous state')
 
     args = parser.parse_args()
@@ -764,6 +792,7 @@ async def main():
         output_dir=output_dir,
         frameworks=args.frameworks,
         base_dir=Path(args.base_dir) if args.base_dir else output_dir,
+        reuse_from=Path(args.reuse_from) if args.reuse_from else None,
     )
 
     if args.resume:

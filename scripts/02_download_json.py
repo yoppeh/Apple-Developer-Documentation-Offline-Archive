@@ -13,25 +13,9 @@ from pathlib import Path
 from typing import Dict, Set
 from tqdm import tqdm
 import argparse
+
+from apple_http import AdaptiveRateLimiter, fetch
 from datetime import datetime
-
-
-class RateLimiter:
-    """Rate limiter to avoid overwhelming Apple's servers"""
-
-    def __init__(self, requests_per_second: float = 5.0):
-        self.delay = 1.0 / requests_per_second
-        self.last_request = 0.0
-        # Serialize callers; otherwise concurrent tasks all pass the check at once
-        self._lock = asyncio.Lock()
-
-    async def wait(self):
-        async with self._lock:
-            now = time.time()
-            time_since_last = now - self.last_request
-            if time_since_last < self.delay:
-                await asyncio.sleep(self.delay - time_since_last)
-            self.last_request = time.time()
 
 
 class DocumentationDownloader:
@@ -62,7 +46,7 @@ class DocumentationDownloader:
         }
 
         # Rate limiting
-        self.rate_limiter = RateLimiter(requests_per_second=5.0)
+        self.rate_limiter = AdaptiveRateLimiter(rate=10.0, max_rate=15.0)
 
         # User agent
         self.user_agent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
@@ -94,60 +78,36 @@ class DocumentationDownloader:
 
     async def download_page(self, session: aiohttp.ClientSession, doc_path: str) -> bool:
         """Download a single documentation page"""
-        await self.rate_limiter.wait()
-
         url = f'https://developer.apple.com/tutorials/data/documentation/{doc_path}.json'
-        headers = {'User-Agent': self.user_agent}
-
-        try:
-            async with session.get(url, headers=headers) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    data = json.loads(content)
-
-                    # Save JSON file
-                    output_file = self.raw_json_dir / f'{doc_path}.json'
-                    output_file.parent.mkdir(parents=True, exist_ok=True)
-
-                    with open(output_file, 'w') as f:
-                        json.dump(data, f, indent=2)
-
-                    # Update manifest
-                    self.manifest[doc_path] = {
-                        'url': url,
-                        'local_path': str(output_file.relative_to(self.base_dir)),
-                        'last_modified': response.headers.get('Last-Modified', ''),
-                        'etag': response.headers.get('ETag', ''),
-                        'sha256': self.calculate_sha256(content),
-                        'downloaded_at': datetime.now().isoformat(),
-                        'title': data.get('metadata', {}).get('title', ''),
-                        'role': data.get('metadata', {}).get('role', ''),
-                    }
-
-                    self.downloaded.add(doc_path)
-                    self.stats['downloaded'] += 1
-                    return True
-
-                elif response.status == 404:
-                    print(f"\n404 Not Found: {url}")
-                    self.stats['failed'] += 1
-                    return False
-
-                elif response.status == 429:
-                    # Rate limited
-                    print(f"\nRate limited. Waiting 30 seconds...")
-                    await asyncio.sleep(30)
-                    return await self.download_page(session, doc_path)
-
-                else:
-                    print(f"\nError {response.status}: {url}")
-                    self.stats['failed'] += 1
-                    return False
-
-        except Exception as e:
-            print(f"\nException downloading {doc_path}: {e}")
+        result = await fetch(session, self.rate_limiter, url, self.user_agent)
+        if result is None or result[0] != 200:
+            if result is not None:
+                print(f"\nError {result[0]}: {url}")
             self.stats['failed'] += 1
             return False
+        _, content, headers = result
+        data = json.loads(content)
+
+        # Save JSON file
+        output_file = self.raw_json_dir / f'{doc_path}.json'
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, 'w') as f:
+            json.dump(data, f, indent=2)
+
+        # Update manifest
+        self.manifest[doc_path] = {
+            'url': url,
+            'local_path': str(output_file.relative_to(self.base_dir)),
+            'last_modified': headers.get('Last-Modified', ''),
+            'etag': headers.get('ETag', ''),
+            'sha256': self.calculate_sha256(content),
+            'downloaded_at': datetime.now().isoformat(),
+            'title': data.get('metadata', {}).get('title', ''),
+            'role': data.get('metadata', {}).get('role', ''),
+        }
+        self.downloaded.add(doc_path)
+        self.stats['downloaded'] += 1
+        return True
 
     async def download_all(self, frameworks: list = None):
         """Download all pages from index"""
