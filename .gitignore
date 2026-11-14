@@ -57,3 +57,6 @@ htmlcov/
 
 # Documentation builds
 docs/_build/
+
+# MCP server search index
+.mcp-index.sqlite*
