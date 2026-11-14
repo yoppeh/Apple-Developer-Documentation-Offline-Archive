@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "apple-docs": {
+      "url": "http://localhost:9111/mcp"
+    }
+  }
+}
