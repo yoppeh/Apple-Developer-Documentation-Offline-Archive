@@ -120,7 +120,36 @@ def doc_file(doc_path: str) -> Path | None:
             continue
         if f.is_file():
             return f
+    # Older archives also hold pages under CamelCase names (Apple paths are
+    # case-insensitive); find those before concluding the page is missing
+    for root in ROOTS:
+        f = _find_case_insensitive(root, doc_path)
+        if f:
+            return f
     return None
+
+
+def _find_case_insensitive(root: Path, doc_path: str) -> Path | None:
+    """Find doc_path under root ignoring case, trying every spelling at each level
+    (an old archive can have both nsfetchrequest/ and NSFetchRequest/)."""
+    def walk(cur: Path, parts: list[str]) -> Path | None:
+        last = len(parts) == 1
+        want = (parts[0] + ".md" if last else parts[0]).lower()
+        try:
+            matches = [e for e in os.listdir(cur) if e.lower() == want]
+        except OSError:
+            return None
+        for name in sorted(matches, key=lambda e: e != want):  # lowercase spelling first
+            candidate = cur / name
+            if last:
+                if candidate.is_file():
+                    return candidate
+            elif candidate.is_dir():
+                found = walk(candidate, parts[1:])
+                if found:
+                    return found
+        return None
+    return walk(root, doc_path.split("/"))
 
 
 def is_ondemand(f: Path) -> bool:
@@ -678,8 +707,9 @@ class SearchIndex:
                             if name.endswith(".md"):
                                 p = Path(root, name)
                                 rel = os.path.relpath(p, md_root)[:-3].replace(os.sep, "/")
-                                if rel not in on_disk:
-                                    on_disk[rel] = (p, p.stat().st_mtime)
+                                key = rel.lower()  # one entry per page, even if an old archive
+                                if key not in on_disk:  # has it under two spellings
+                                    on_disk[key] = (p, p.stat().st_mtime)
                 changed = [k for k, (_, m) in on_disk.items() if k not in known or known[k][1] != m]
                 removed = [k for k in known if k not in on_disk]
                 total = len(changed)
